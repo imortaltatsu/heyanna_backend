@@ -84,9 +84,9 @@ class TTLCache:
             self._data[key] = (expires_at, value)
 
 
-_market_search_cache = TTLCache(ttl_seconds=10)
-_market_detail_cache = TTLCache(ttl_seconds=10)
-_market_trades_cache = TTLCache(ttl_seconds=5)
+_market_search_cache = TTLCache(ttl_seconds=2)
+_market_detail_cache = TTLCache(ttl_seconds=2)
+_market_trades_cache = TTLCache(ttl_seconds=1)
 
 
 def get_base_dir() -> Path:
@@ -1112,8 +1112,8 @@ async def background_analysis_worker(cache: AnalysisCache) -> None:
             # Warm all analyses with a tqdm progress bar; heavy work runs in
             # background threads via AnalysisCache._compute_analysis.
             # Run several analyses concurrently to better use CPU while
-            # respecting DuckDB and I/O limits.
-            concurrency = 4
+            # respecting DuckDB and I/O limits on a 32-core machine.
+            concurrency = 8
             pbar = tqdm(total=len(ANALYSIS_NAMES), desc="Analyses", leave=False)
 
             sem = asyncio.Semaphore(concurrency)

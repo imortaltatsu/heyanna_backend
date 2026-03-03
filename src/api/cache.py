@@ -54,9 +54,14 @@ class AnalysisCache:
         self.base_dir = base_dir or Path.cwd()
         self.trades_dir = self.base_dir / "data" / "kalshi" / "trades"
         self.markets_dir = self.base_dir / "data" / "kalshi" / "markets"
+        self.analytics_dir = self.base_dir / "data" / "analytics"
+        self.analytics_dir.mkdir(parents=True, exist_ok=True)
         self.refresh_interval = refresh_interval
         self._cache: dict[str, CacheEntry] = {}
         self._lock = asyncio.Lock()
+        # Best-effort load of any persisted analysis snapshots so the API
+        # can serve warm data immediately after process start.
+        self._load_persisted_snapshots()
 
     def _generate_key(self, analysis_name: str, params: Optional[dict] = None) -> str:
         """Generate a cache key for an analysis."""
@@ -96,7 +101,8 @@ class AnalysisCache:
             expires_at=expires_at,
         )
 
-        # Store the new entry under the lock.
+        # Persist snapshot to disk and store the new entry under the lock.
+        self._persist_snapshot(analysis_name, new_entry)
         async with self._lock:
             self._cache[key] = new_entry
             return new_entry
@@ -164,6 +170,58 @@ class AnalysisCache:
             result["metadata"]["has_figure"] = True
 
         return result
+
+    def _snapshot_path(self, analysis_name: str) -> Path:
+        """Path for persisted snapshot JSON for a given analysis."""
+        return self.analytics_dir / f"{analysis_name}.json"
+
+    def _persist_snapshot(self, analysis_name: str, entry: CacheEntry) -> None:
+        """Persist a lightweight snapshot of the analysis to disk."""
+        try:
+            snapshot = {
+                "analysis": analysis_name,
+                "created_at": datetime.fromtimestamp(entry.created_at).isoformat(),
+                "data": entry.data,
+            }
+            path = self._snapshot_path(analysis_name)
+            path.write_text(json.dumps(snapshot, default=str))
+        except Exception:
+            # Snapshot persistence is best-effort; avoid breaking requests.
+            return
+
+    def _load_persisted_snapshots(self) -> None:
+        """Load any persisted analysis snapshots into the in-memory cache."""
+        try:
+            for path in self.analytics_dir.glob("*.json"):
+                try:
+                    snapshot = json.loads(path.read_text())
+                except Exception:
+                    continue
+
+                analysis_name = snapshot.get("analysis") or path.stem
+                key = self._generate_key(analysis_name, None)
+
+                created_iso = snapshot.get("created_at")
+                try:
+                    created_ts = (
+                        datetime.fromisoformat(created_iso).timestamp()
+                        if created_iso
+                        else time.time()
+                    )
+                except Exception:
+                    created_ts = time.time()
+
+                entry = CacheEntry(
+                    key=key,
+                    data=snapshot.get("data", {}),
+                    output=None,
+                    created_at=created_ts,
+                    expires_at=time.time() + self.refresh_interval,
+                )
+                self._cache[key] = entry
+        except Exception:
+            # If anything goes wrong, just start with an empty cache.
+            return
 
     async def refresh_all(self) -> dict[str, CacheEntry]:
         """Force refresh all cached entries."""

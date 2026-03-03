@@ -33,8 +33,10 @@ class KalshiCalibrationDeviationOverTimeAnalysis(Analysis):
         """Execute the analysis and return outputs."""
         con = duckdb.connect()
 
-        # Query all trades joined with resolved market outcomes
-        df = con.execute(
+        # Compute weekly calibration deviation directly in DuckDB in a single
+        # pass instead of looping in Python over each week. This is much
+        # faster and scales better.
+        output_df = con.execute(
             f"""
             WITH resolved_markets AS (
                 SELECT ticker, result
@@ -50,8 +52,8 @@ class KalshiCalibrationDeviationOverTimeAnalysis(Analysis):
                         ELSE t.no_price
                     END AS price,
                     CASE
-                        WHEN t.taker_side = m.result THEN true
-                        ELSE false
+                        WHEN t.taker_side = m.result THEN 1
+                        ELSE 0
                     END AS won
                 FROM '{self.trades_dir}/*.parquet' t
                 INNER JOIN resolved_markets m ON t.ticker = m.ticker
@@ -67,62 +69,35 @@ class KalshiCalibrationDeviationOverTimeAnalysis(Analysis):
                         ELSE t.yes_price
                     END AS price,
                     CASE
-                        WHEN t.taker_side != m.result THEN true
-                        ELSE false
+                        WHEN t.taker_side != m.result THEN 1
+                        ELSE 0
                     END AS won
                 FROM '{self.trades_dir}/*.parquet' t
                 INNER JOIN resolved_markets m ON t.ticker = m.ticker
                 WHERE t.yes_price > 0 AND t.no_price > 0
+            ),
+            per_price_week AS (
+                SELECT
+                    date_trunc('week', created_time) AS week,
+                    price,
+                    SUM(won) AS wins,
+                    COUNT(*) AS total
+                FROM trade_positions
+                WHERE price BETWEEN 1 AND 99
+                GROUP BY week, price
+            ),
+            per_week AS (
+                SELECT
+                    week AS date,
+                    AVG(ABS(100.0 * wins / total - price)) AS mean_absolute_deviation
+                FROM per_price_week
+                GROUP BY week
+                ORDER BY week
             )
-            SELECT created_time, price, won
-            FROM trade_positions
-            WHERE price >= 1 AND price <= 99
-            ORDER BY created_time
+            SELECT date, mean_absolute_deviation
+            FROM per_week
             """
         ).df()
-
-        # Group by week and compute cumulative calibration deviation
-        df["created_time"] = pd.to_datetime(df["created_time"], utc=True)
-        min_date = df["created_time"].min()
-        max_date = df["created_time"].max()
-
-        # Calculate week boundaries
-        week_dates = pd.date_range(start=min_date, end=max_date, freq="W")
-
-        dates = []
-        deviations = []
-
-        for end_date in week_dates:
-            # Get ALL trades from start up to this week (cumulative)
-            cumulative_df = df[df["created_time"] <= end_date]
-
-            # Aggregate by price across all historical trades
-            agg = (
-                cumulative_df.groupby("price")
-                .agg(
-                    total=("won", "count"),
-                    wins=("won", "sum"),
-                )
-                .reset_index()
-            )
-
-            # Skip if not enough cumulative data yet
-            if agg["total"].sum() < 1000:
-                continue
-
-            # Calculate cumulative win rates
-            prices = agg["price"].values.astype(float)
-            win_rates = 100.0 * agg["wins"].values / agg["total"].values
-
-            # Calculate mean absolute deviation from perfect calibration
-            absolute_deviations = np.abs(win_rates - prices)
-            mean_deviation = np.mean(absolute_deviations)
-
-            dates.append(end_date)
-            deviations.append(mean_deviation)
-
-        # Create output dataframe
-        output_df = pd.DataFrame({"date": dates, "mean_absolute_deviation": deviations})
 
         # The API only needs tabular data and chart config. Creating full
         # matplotlib figures is relatively expensive and unnecessary for

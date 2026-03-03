@@ -11,6 +11,14 @@ import pandas as pd
 from src.common.analysis import Analysis, AnalysisOutput
 from src.common.interfaces.chart import ChartConfig, ChartType, UnitType
 
+try:
+    import cudf  # type: ignore[import]
+
+    HAS_CUDF = True
+except Exception:  # pragma: no cover - optional dependency
+    cudf = None  # type: ignore[assignment]
+    HAS_CUDF = False
+
 
 class WinRateByPriceAnalysis(Analysis):
     """Analyze win rate by price to assess market calibration on Kalshi."""
@@ -30,43 +38,85 @@ class WinRateByPriceAnalysis(Analysis):
 
     def run(self) -> AnalysisOutput:
         """Execute the analysis and return outputs."""
-        con = duckdb.connect()
+        if HAS_CUDF:
+            # GPU-accelerated path using cuDF: read Parquet directly on GPU,
+            # compute positions and win rates, then convert the small,
+            # aggregated result back to pandas for charting.
+            trades_gdf = cudf.read_parquet(str(self.trades_dir / "*.parquet"))
+            markets_gdf = cudf.read_parquet(str(self.markets_dir / "*.parquet"))
 
-        df = con.execute(
-            f"""
-            WITH resolved_markets AS (
-                SELECT ticker, result
-                FROM '{self.markets_dir}/*.parquet'
-                WHERE status = 'finalized'
-                  AND result IN ('yes', 'no')
-            ),
-            all_positions AS (
-                -- Taker side
-                SELECT
-                    CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
-                    CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won
-                FROM '{self.trades_dir}/*.parquet' t
-                INNER JOIN resolved_markets m ON t.ticker = m.ticker
+            resolved = markets_gdf[
+                (markets_gdf["status"] == "finalized")
+                & (markets_gdf["result"].isin(["yes", "no"]))
+            ][["ticker", "result"]]
 
-                UNION ALL
+            merged = trades_gdf.merge(resolved, on="ticker", how="inner")
 
-                -- Maker side (counterparty)
-                SELECT
-                    CASE WHEN t.taker_side = 'yes' THEN t.no_price ELSE t.yes_price END AS price,
-                    CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won
-                FROM '{self.trades_dir}/*.parquet' t
-                INNER JOIN resolved_markets m ON t.ticker = m.ticker
+            # Taker side positions
+            taker_price = merged["yes_price"].where(
+                merged["taker_side"] == "yes", merged["no_price"]
             )
-            SELECT
-                price,
-                COUNT(*) AS total_trades,
-                SUM(won) AS wins,
-                100.0 * SUM(won) / COUNT(*) AS win_rate
-            FROM all_positions
-            GROUP BY price
-            ORDER BY price
-            """
-        ).df()
+            taker_won = (merged["taker_side"] == merged["result"]).astype("int8")
+            taker_positions = cudf.DataFrame({"price": taker_price, "won": taker_won})
+
+            # Maker side positions (counterparty)
+            maker_price = merged["no_price"].where(
+                merged["taker_side"] == "yes", merged["yes_price"]
+            )
+            maker_won = (merged["taker_side"] != merged["result"]).astype("int8")
+            maker_positions = cudf.DataFrame({"price": maker_price, "won": maker_won})
+
+            all_positions = cudf.concat([taker_positions, maker_positions], ignore_index=True)
+
+            grouped = (
+                all_positions.groupby("price")
+                .agg({"won": ["count", "sum"]})
+                .reset_index()
+            )
+            # Flatten multi-index columns
+            grouped.columns = ["price", "total_trades", "wins"]
+            grouped["win_rate"] = 100.0 * grouped["wins"] / grouped["total_trades"]
+
+            df = grouped.to_pandas()
+            df = df.sort_values("price").reset_index(drop=True)
+        else:
+            # CPU path using DuckDB over Parquet, as before.
+            con = duckdb.connect()
+            df = con.execute(
+                f"""
+                WITH resolved_markets AS (
+                    SELECT ticker, result
+                    FROM '{self.markets_dir}/*.parquet'
+                    WHERE status = 'finalized'
+                      AND result IN ('yes', 'no')
+                ),
+                all_positions AS (
+                    -- Taker side
+                    SELECT
+                        CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
+                        CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won
+                    FROM '{self.trades_dir}/*.parquet' t
+                    INNER JOIN resolved_markets m ON t.ticker = m.ticker
+
+                    UNION ALL
+
+                    -- Maker side (counterparty)
+                    SELECT
+                        CASE WHEN t.taker_side = 'yes' THEN t.no_price ELSE t.yes_price END AS price,
+                        CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won
+                    FROM '{self.trades_dir}/*.parquet' t
+                    INNER JOIN resolved_markets m ON t.ticker = m.ticker
+                )
+                SELECT
+                    price,
+                    COUNT(*) AS total_trades,
+                    SUM(won) AS wins,
+                    100.0 * SUM(won) / COUNT(*) AS win_rate
+                FROM all_positions
+                GROUP BY price
+                ORDER BY price
+                """
+            ).df()
 
         fig = self._create_figure(df)
         chart = self._create_chart(df)
