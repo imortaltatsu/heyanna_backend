@@ -148,13 +148,17 @@ class AnalysisCache:
         analysis_name: str,
         params: Optional[dict] = None,
     ) -> Optional[CacheEntry]:
-        """Return cached result if present and valid, without recomputing."""
+        """Return the latest cached result if present, without recomputing.
+
+        This intentionally ignores TTL/expiration so that APIs always have a
+        "hot" snapshot to serve, even while a fresher version is being
+        recomputed in the background. The refresh interval only controls when
+        background workers should recompute, not whether an existing value can
+        be served.
+        """
         key = self._generate_key(analysis_name, params)
         async with self._lock:
-            entry = self._cache.get(key)
-            if entry and not entry.is_expired():
-                return entry
-            return None
+            return self._cache.get(key)
 
     def _serialize_output(self, output: AnalysisOutput) -> dict:
         """Convert AnalysisOutput to serializable dict."""
@@ -224,12 +228,17 @@ class AnalysisCache:
             return
 
     async def refresh_all(self) -> dict[str, CacheEntry]:
-        """Force refresh all cached entries."""
+        """Mark all cached entries as stale without dropping the hot state.
+
+        This forces background workers to recompute analyses soon (because
+        their TTL has effectively expired) while allowing APIs to continue
+        serving the last known-good snapshot from memory.
+        """
         async with self._lock:
-            keys = list(self._cache.keys())
-            for key in keys:
-                del self._cache[key]
-            return self._cache
+            now = time.time()
+            for entry in self._cache.values():
+                entry.expires_at = now
+            return dict(self._cache)
 
     def get_stats(self) -> dict:
         """Get cache statistics."""

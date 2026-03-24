@@ -175,6 +175,15 @@ class DashboardResponse(BaseModel):
     pending_analyses: list[str] = []
 
 
+class TradingSnapshotResponse(BaseModel):
+    """Lightweight trading snapshot for fast UI display."""
+
+    win_rate_percent: float
+    total_trades: int
+    total_volume: int
+    refreshed_at: datetime
+
+
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     """Health check endpoint."""
@@ -202,6 +211,52 @@ async def health_check() -> dict[str, Any]:
         "cache_size": cache_stats["size"],
         "cache_refresh_interval_seconds": cache_stats["refresh_interval_seconds"],
     }
+
+
+@app.get("/api/v1/trading_snapshot")
+async def get_trading_snapshot() -> TradingSnapshotResponse:
+    """Get a fast trading snapshot (win rate, total trades, total volume).
+
+    Served from cached meta_stats and win_rate_by_price. Uses win_rate_by_price
+    to derive overall win rate when meta_stats has an old snapshot without it.
+    """
+    cache = get_cache_instance()
+    meta_entry = await cache.get_cached("meta_stats")
+    if meta_entry is None:
+        raise HTTPException(
+            status_code=202,
+            detail={
+                "status": "computing",
+                "message": "Trading snapshot is still computing and will be available shortly.",
+            },
+        )
+
+    rows = meta_entry.data.get("data", [])
+    metrics = {row.get("metric"): row for row in rows}
+
+    total_trades = int(metrics.get("num_trades", {}).get("value", 0) or 0)
+    total_volume = int(metrics.get("total_volume", {}).get("value", 0) or 0)
+    win_rate_percent = float(
+        metrics.get("win_rate_percent", {}).get("value", 0.0) or 0.0
+    )
+
+    # Fallback: derive overall win rate from win_rate_by_price when meta_stats
+    # has an old snapshot (no win_rate_percent) or returns 0.
+    if win_rate_percent == 0.0 and total_trades > 0:
+        wr_entry = await cache.get_cached("win_rate_by_price")
+        if wr_entry:
+            wr_data = wr_entry.data.get("data", [])
+            total_wr = sum(r.get("total_trades", 0) or 0 for r in wr_data)
+            total_wins = sum(r.get("wins", 0) or 0 for r in wr_data)
+            if total_wr > 0:
+                win_rate_percent = 100.0 * total_wins / total_wr
+
+    return TradingSnapshotResponse(
+        win_rate_percent=round(win_rate_percent, 2),
+        total_trades=total_trades,
+        total_volume=total_volume,
+        refreshed_at=datetime.fromtimestamp(meta_entry.created_at),
+    )
 
 
 @app.get("/api/v1/dashboard")

@@ -58,6 +58,59 @@ class MetaStatsAnalysis(Analysis):
         num_markets = market_stats[0]
         num_events = market_stats[1]
 
+        # Global win rate across all positions (taker and maker sides).
+        # This reuses the same resolved_markets + trade_positions pattern as
+        # other analyses but collapses everything into a single snapshot
+        # number so it can be served cheaply from cache.
+        win_stats = con.execute(
+            f"""
+            WITH resolved_markets AS (
+                SELECT ticker, result
+                FROM '{self.markets_dir}/*.parquet'
+                WHERE result IN ('yes', 'no')
+            ),
+            trade_positions AS (
+                -- Buyer side (taker)
+                SELECT
+                    CASE
+                        WHEN t.taker_side = 'yes' THEN t.yes_price
+                        ELSE t.no_price
+                    END AS price,
+                    CASE
+                        WHEN t.taker_side = m.result THEN 1
+                        ELSE 0
+                    END AS won
+                FROM '{self.trades_dir}/*.parquet' t
+                INNER JOIN resolved_markets m ON t.ticker = m.ticker
+                WHERE t.yes_price > 0 AND t.no_price > 0
+
+                UNION ALL
+
+                -- Seller side (counterparty)
+                SELECT
+                    CASE
+                        WHEN t.taker_side = 'yes' THEN t.no_price
+                        ELSE t.yes_price
+                    END AS price,
+                    CASE
+                        WHEN t.taker_side != m.result THEN 1
+                        ELSE 0
+                    END AS won
+                FROM '{self.trades_dir}/*.parquet' t
+                INNER JOIN resolved_markets m ON t.ticker = m.ticker
+                WHERE t.yes_price > 0 AND t.no_price > 0
+            )
+            SELECT
+                SUM(won) AS total_wins,
+                COUNT(*) AS total_positions
+            FROM trade_positions
+            """
+        ).fetchone()
+
+        total_wins = win_stats[0] or 0
+        total_positions = win_stats[1] or 0
+        win_rate = (total_wins / total_positions) if total_positions > 0 else 0.0
+
         # Build DataFrame with statistics
         df = pd.DataFrame(
             [
@@ -95,6 +148,16 @@ class MetaStatsAnalysis(Analysis):
                     "metric": "num_tickers_from_trades",
                     "value": num_tickers_from_trades,
                     "formatted": self._format_number(num_tickers_from_trades),
+                },
+                {
+                    "metric": "win_rate",
+                    "value": win_rate,
+                    "formatted": f"{win_rate:.4f}",
+                },
+                {
+                    "metric": "win_rate_percent",
+                    "value": win_rate * 100.0,
+                    "formatted": f"{win_rate * 100.0:.2f}",
                 },
             ]
         )
